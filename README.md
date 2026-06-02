@@ -50,6 +50,25 @@ Anyone who needs to publish regularly to Facebook/Instagram from a team in the f
 
 ---
 
+## Quick Start
+
+> Full details for each step are in [§4 Setup](#4-setup).
+
+1. **Copy the `.gs` files** into a new Google Apps Script project bound to your Google Spreadsheet.
+2. **Fill in secrets** — open `Setup.gs`, paste your real keys into `initScriptProperties()`, run it once, then restore the placeholder values.
+3. **Run `ensureHeaders()`** to write column headers I–R on the sheet.
+4. **Run `setup()`** to install all time-based triggers.
+5. **Deploy as Web App** (Execute as: Me, Who has access: Anyone). Copy the `/exec` URL — this is your `APPS_SCRIPT_URL`.
+6. **Create a Telegram bot** via `@BotFather`. Note the token.
+7. **Create an Activepieces Cloud account** and add connections for Telegram Bot, Google Sheets, and Google Drive.
+8. **Build the inbound flow** following `activepieces-inbound-flow.md`. Paste `<WEBAPP_URL>`, `<SHARED_SECRET>`, and your whitelist inline.
+9. **Build the polling flow** following `activepieces-polling-flow.md`.
+10. *(Optional)* Build the writer bot flow following `activepieces-writer-flow.md`.
+11. **Share your Drive media folder** as "Anyone with the link can view" (see [§4.7](#47-drive-folder-must-be-permanently-shared)).
+12. Send a test message to your bot and verify the end-to-end flow.
+
+---
+
 # Telegram → Activepieces → Apps Script — Social Posting Pipeline (v4)
 
 A production-grade automation that lets a small group of authorized Telegram users draft, review, and publish Facebook Page + Instagram posts without ever opening a spreadsheet. The Google Apps Script project remains the AI processing and posting engine — Activepieces is a thin orchestration layer in front of it that handles Telegram I/O, the 60-second media-collection window, approval cards, reminders, and post-success confirmations.
@@ -293,7 +312,7 @@ You will need:
 
    First, hit the `/exec` URL in a browser (GET → `doGet`). You should see:
    ```json
-   {"ok":true,"service":"lina-singhal-poster","version":"v3-telegram"}
+   {"ok":true,"service":"social-poster","version":"v4-telegram"}
    ```
    That confirms the deployment is reachable.
 
@@ -629,7 +648,7 @@ Send a video. Verify Status flips to `Pending (IG)` after FB success. Verify the
 | File | Purpose |
 |------|---------|
 | `Config.gs` | Constants, getters, helpers. Includes Telegram/Activepieces columns, stamp helpers, `findCollectingRowForUser`, `supersedeOlderDrafts`, `updateIdSeen`/`markUpdateIdSeen`. |
-| `Setup.gs` | One-time setup. `initScriptProperties` (FB_PAGE_ID + IG_USER_ID hard-coded), `ensureHeaders`, `setup` (installs form-submit + 4h checks + daily archive triggers). |
+| `Setup.gs` | One-time setup. `initScriptProperties` (fill in placeholders for all API keys and IDs), `ensureHeaders`, `setup` (installs form-submit + 4h checks + daily archive triggers). |
 | `Processing.gs` | `processRow` — runs Sarvam, supersedes older drafts, sets Draft. Gates email on Telegram-id absence. Includes `callSarvamAPI` and `stripCodeFences` helpers reused by Writer.gs. |
 | `Posting.gs` | `postRow` + IG flow. Captures FB/IG post IDs, stamps `Posted_At`. IG image aspect-ratio padding via wsrv.nl proxy (`getIgImageUrl`). |
 | `Telegram.gs` | Web App `doPost()` — post-bot actions (`add_to_draft`, `finalize_collecting`, `check_update_id`, `process`, `approve`, `setStatus`, `appendError`) plus writer-bot actions (`rewrite_text`, `generate_article`). Same endpoint for both bots; routed by `action`. |
@@ -659,93 +678,49 @@ Send a video. Verify Status flips to `Pending (IG)` after FB success. Verify the
 
 ---
 
-## 10. Sketch: the news-article extension (separate automation)
+## 10. Roadmap
 
-You asked whether the same Telegram → Activepieces → Sarvam plumbing could be reused for a "user dictates a news brief, Sarvam turns it into a polished article, user iterates until happy" flow — without media, without FB/IG. Yes, very cleanly. Here's the design I'd build if you greenlight it.
+### News-article generation bot
 
-### Trigger and routing
+The same Telegram → Activepieces → Sarvam plumbing can support a second, independent workflow: the user sends a brief in Telegram, Sarvam drafts a polished news-style article, the user iterates until satisfied, and the result is exported as a Google Doc — no FB/IG posting involved.
 
-Reuse the **same** Telegram inbound webhook. Add a one-line check at the top of `Parse + Whitelist`: if the message starts with `/news` (or matches a configurable command list), set `__route: 'news'`. The first node after `Halt?` becomes a `Switch` on `__route` — the existing branches go to "social" (current behavior); the new branch goes to "news".
+**Proposed design:**
 
-This means the user has a single Telegram number for both flows. Commands like `/news` and `/post` (we can add `/post` too as an explicit signal) make intent unambiguous. Without a slash command, the default stays "social" so existing users are unaffected.
+- A `/news` command prefix routes the inbound message to the article flow; all other messages continue as social posts — no disruption to existing users.
+- A separate `Articles` tab in the same spreadsheet holds article rows, keeping the social posting code untouched.
+- A new `Articles.gs` file adds three `doPost` handlers: `article_create`, `article_iterate`, `article_finalize`.
+- A separate polling workflow targets the `Articles` tab so article processing can be paused independently.
 
-### Sheet tab
-
-A second tab in the same spreadsheet, called `Articles`. Schema:
+**Proposed `Articles` tab schema:**
 
 | Col | Header | Set by | Purpose |
 |-----|--------|--------|---------|
-| A | Timestamp | Activepieces | Article creation time |
-| B | Original_Brief | Activepieces | Concatenated user input across the conversation |
+| A | Timestamp | Activepieces | Row creation time |
+| B | Original_Brief | Activepieces | Cumulative user input across iterations |
 | C | Current_Article | Apps Script | Sarvam's latest draft |
 | D | Iteration_Count | Apps Script | Number of refinement passes |
-| E | Status | All | Drafting / Iterating / Finalized / Error |
-| F | Article_Doc_URL | Apps Script | Google Doc link, populated on finalize |
-| G | Logs | All | Audit trail |
+| E | Status | All | `Drafting` / `Iterating` / `Finalized` / `Error` |
+| F | Article_Doc_URL | Apps Script | Google Doc URL, set on finalize |
+| G | Logs | All | Timestamped audit trail |
 | H | Row_ID | Activepieces / Apps Script | UUID |
-| I | Telegram_User_Id | Activepieces | Sender phone |
-| J | Approval_Requested | Activepieces polling | TRUE once latest draft sent |
-| K | Confirmation_Sent | Activepieces polling | TRUE once Doc link delivered |
+| I | Telegram_User_Id | Activepieces | Telegram numeric user id |
+| J | Approval_Requested | Polling flow | `TRUE` once draft card sent |
+| K | Confirmation_Sent | Polling flow | `TRUE` once Doc link delivered |
 
-Same `Row_ID` discipline, same `Approval_Requested` polling pattern, same idempotency story. Different tab so the existing social posting code never sees these rows.
+---
 
-### Apps Script
+## Contributing
 
-A new file, `Articles.gs`, with three handlers added to `doPost()`:
+Pull requests are welcome. For significant changes, please open an issue first to discuss the approach.
 
-- `article_create`(phone, brief, update_id) — append a new row to `Articles`, call Sarvam with the news-article prompt, store the result in `Current_Article`, set Status=`Drafting`, return `row_id`.
-- `article_iterate`(row_id, refinement_text) — append the user's refinement text to `Original_Brief` (so context grows), re-run Sarvam with the article-so-far + refinement instructions, increment `Iteration_Count`, store new draft, return.
-- `article_finalize`(row_id) — create a Google Doc with the article, set Status=`Finalized`, store the Doc URL, return URL.
+- Keep secrets out of code — all credentials go into Google Apps Script Script Properties via `initScriptProperties()` in `Setup.gs`.
+- Follow the existing `doPost` action pattern when adding new endpoints to `Telegram.gs`.
+- Update the relevant Activepieces `*.md` flow spec if your change affects the Activepieces side.
+- Test both the Telegram ingestion path and the Google Form path when touching shared processing logic in `Processing.gs` or `Posting.gs`.
 
-The Sarvam prompt is rewritten for a news-article voice — third-person reportage, dateline, lead paragraph with the 5 Ws, neutral tone, structured paragraphs, configurable target word count (e.g. 250–400). Hashtags and slogans are omitted.
+---
 
-The iteration loop is unbounded but soft-capped — after 5 iterations, `article_iterate` returns a hint that the user might want to finalize.
+## License
 
-### Activepieces flow (sketch)
+[MIT](LICENSE)
 
-```
-Telegram inbound (existing webhook)
-   │
-   ▼
-Parse + Whitelist  ───── /news prefix? ─── yes ─► news flow
-   │                                                │
-   no (existing social flow)                        │
-                                                    ▼
-                                       Lookup most-recent Article row for sender
-                                                    │
-                                       ┌────────────┴───────────┐
-                                       │                         │
-                                  No active article         Active Drafting/Iterating row
-                                       │                         │
-                                       ▼                         │
-                              Apps Script article_create         │
-                                       │            ┌────────────┴──────────────┐
-                                       │            │                            │
-                                       │      Button reply: Approve         New text body
-                                       │            │                            │
-                                       │            ▼                            ▼
-                                       │  Apps Script article_finalize   Apps Script article_iterate
-                                       │            │                            │
-                                       │            ▼                            ▼
-                                       │  Send Doc URL via Telegram      Send updated article + buttons
-                                       └─►  (acknowledge, polling sends draft card)
-```
-
-The polling workflow's Send Approval Card branch is generalized to look at *both* tabs (filter by `Status=Drafting OR Iterating`) — same pattern, same idempotency flags, just a different table.
-
-### What changes vs. the social flow
-
-- **No media handling.** Article creation is text-only — drop the `Has Media?` branch entirely for this route.
-- **Unbounded iteration vs. binary approve/edit.** The button card has Approve and "Refine" — Refine sets Status=`Iterating`, and any subsequent text becomes refinement instructions. No separate "Awaiting Edit" state.
-- **Output is a Google Doc, not a social post.** `DriveApp.createFile` (or `DocumentApp.create`) generates a versioned Doc. The link goes back via Telegram.
-- **Different Sarvam prompt.** The social-worker / political-content prompt is wrong for news. A second prompt template lives in `Articles.gs`.
-
-### Effort
-
-A focused day's work: ~2 hours for `Articles.gs`, ~2 hours to extend the inbound webhook with the `/news` route + branch, ~2 hours to extend the polling workflow to read the second tab and send article-shaped approval cards. Plus testing.
-
-### My recommendation
-
-Build it. The architectural fit is clean (same plumbing, different prompt + tab), and it gives the same user a second high-leverage workflow on the same channel. The risk is low because the social flow is unaffected — `/news` is opt-in.
-
-If you want me to build it, say the word and I'll add a third workflow + a sheet tab + an `Articles.gs`. I'd also recommend deciding now whether to keep `/news` in the same Activepieces workflow (smaller footprint, simpler ops) or split into a separate workflow file (cleaner separation, slightly more setup). My default would be: **same inbound webhook (single Meta subscription is simpler), split polling — a third polling workflow that targets the `Articles` tab, so you can pause article processing without affecting social posting**.

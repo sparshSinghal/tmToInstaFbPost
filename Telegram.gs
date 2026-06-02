@@ -103,7 +103,7 @@ function doPost(e) {
  * Does NOT expose any data; just returns a static OK.
  */
 function doGet(e) {
-  return jsonOut({ ok: true, service: 'lina-singhal-poster', version: 'v3-telegram' });
+  return jsonOut({ ok: true, service: 'social-poster', version: 'v4-telegram' });
 }
 
 // ── Action handlers ─────────────────────────────────────────────
