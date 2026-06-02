@@ -1,0 +1,47 @@
+# ── macOS ────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+ehthumbs.db
+Thumbs.db
+
+# ── macOS metadata folders ───────────────────────────────────
+__MACOSX/
+
+# ── Editor / IDE ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Node / npm (if any tooling is added later) ───────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Environment and secrets ──────────────────────────────────
+# Never commit real tokens. All secrets go into Google Apps Script
+# Script Properties via initScriptProperties() in Setup.gs.
+.env
+.env.*
+*.secret
+secrets.json
+credentials.json
+
+# ── Activepieces exported flow JSON ──────────────────────────
+# These often contain hardcoded secrets (WEBAPP_URL, SHARED_SECRET).
+# Export them from the Activepieces UI but do NOT commit them.
+# The matching *.md spec files (no secrets) are tracked instead.
+activepieces-inbound-flow.json
+activepieces-polling-flow.json
+activepieces-writer-flow.json
+
+# ── Logs and temporary files ─────────────────────────────────
+*.log
+*.tmp
+*.bak
