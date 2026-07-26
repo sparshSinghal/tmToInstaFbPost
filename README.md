@@ -281,7 +281,7 @@ You will need:
 - A Google Form (optional — backward-compat ingestion path)
 - A Google Drive folder dedicated to Telegram media uploads, **shared as "Anyone with the link can view"** (one-time setting in Drive UI — see §4.7)
 - A Telegram bot token (created free via @BotFather — no payment, no business verification)
-- A Meta for Developers app with the **Instagram Graph API** product enabled, a long-lived FB Page Access Token, and a Business/Creator IG account linked to the FB Page (see §4.4 for IG specifics)
+- A Meta for Developers app with the **Instagram Graph API** product enabled, **two Meta access tokens** (a never-expiring Page Access Token for Facebook writes and a long-lived User Access Token for Instagram operations — see §4.4 for why we need both), and a Business/Creator IG account linked to the FB Page
 - An Activepieces Cloud account (cloud.activepieces.com — free tier works for personal volume)
 
 ### 4.1 Apps Script
@@ -290,10 +290,12 @@ You will need:
 
 2. **Set Script Properties.** Open `Setup.gs` → `initScriptProperties()`. The function bakes in `FB_PAGE_ID` and `IG_USER_ID` (public, not secrets). Fill in the real values for the rest:
    - `SARVAM_API_KEY`
-   - `FB_PAGE_ACCESS_TOKEN` — long-lived Page Access Token (see §4.4)
+   - `FB_PAGE_ACCESS_TOKEN` — never-expiring **Page** Access Token, used for Facebook Page writes only (see §4.4)
+   - `IG_USER_ACCESS_TOKEN` — long-lived **User** Access Token, used for Instagram operations only (see §4.4); rotates every ~60 days
    - `NOTIFY_EMAIL` — reviewer email for form-submitted rows (Telegram rows skip email)
    - `ORCHESTRATOR_SHARED_SECRET` — generate a 32+ char random string with a password manager
    - `TELEGRAM_DRIVE_FOLDER_ID` — the Drive folder ID where Activepieces will upload Telegram media
+   - `LOG_LEVEL` — `INFO` (default) or `DEBUG`. Flip to `DEBUG` via the Script Properties UI when investigating FB/IG issues; per-step diagnostics land in the Logs column. Set back to `INFO` for steady-state.
 
    Run `initScriptProperties` once, then immediately replace the secret values with placeholders so they aren't committed to source. (FB_PAGE_ID and IG_USER_ID can stay literal — they're public.)
 
@@ -380,24 +382,38 @@ You will need:
 
 6. **Export the JSON** (Settings → Export Flow) and replace `activepieces-inbound-flow.md` and `activepieces-polling-flow.md` with the resulting `.json` files. Keeps the repo's source-of-truth aligned with what's actually running.
 
-### 4.4 Instagram Graph API connection (one-time)
+### 4.4 Meta access tokens (one-time, then ~60-day rotation)
 
-The code calls the Instagram Graph API via your FB Page Access Token. Setting this up is the most error-prone part of the whole stack — these steps work as of 2026.
+**Why we need two tokens.** Meta's Graph API has an awkward permission split for the endpoints we use:
+
+- **FB Page write endpoints** (`/{page}/photos` with `published=false`, `/{page}/feed` with `attached_media`, `/{page}/videos`) require the caller to *act as the Page*, which only a Page Access Token satisfies. Calling these with a User token returns `(#200) Unpublished posts must be posted to a page as the page itself`.
+- **IG container read endpoints** (`GET /{ig-container-id}?fields=status_code`, used to poll for FINISHED before publishing carousels/videos/Stories) reject Page Access Tokens with error 100 / subcode 33 "Authorization Error", even when the Page token has `instagram_basic` bound to the right IG account. This appears to be a Meta-side enforcement quirk affecting Pages on the New Pages Experience. The same read with a User Access Token holding `instagram_basic` succeeds.
+
+So the code uses each token for the endpoints it accepts:
+
+| Token | Property | Used for |
+|---|---|---|
+| Page Access Token | `FB_PAGE_ACCESS_TOKEN` | All FB Page writes (photos, videos, feed) |
+| User Access Token | `IG_USER_ACCESS_TOKEN` | All IG operations (create container, poll status_code, publish) |
+
+**Rotation cadence.** The Page token is minted from a long-lived user token via `/me/accounts` and is effectively non-expiring (only breaks on password change, revocation, or a security event). The User token itself expires after ~60 days per Meta's Data Access Expiration policy, so `IG_USER_ACCESS_TOKEN` needs to be regenerated every ~50 days to be safe. Set a calendar reminder.
+
+**Setup steps.**
 
 1. **IG account type.** The IG account must be **Business** or **Creator**. Switch in Instagram app → Settings → Account type. (Personal accounts cannot use Graph API.)
 
-2. **Link IG to a FB Page** (so the Page-token route works). Easiest path: **Meta Business Suite** at business.facebook.com → Settings → Business assets → Instagram accounts → Add → "Connect to Page" → pick your FB Page. The Account Center / cross-app login link is **not** sufficient for Graph API — it has to be the Page-Settings-Linked-Accounts link.
+2. **Link IG to a FB Page.** Easiest path: **Meta Business Suite** at business.facebook.com → Settings → Business assets → Instagram accounts → Add → "Connect to Page" → pick your FB Page. The Account Center / cross-app login link is **not** sufficient for Graph API — it has to be the Page-Settings-Linked-Accounts link.
 
 3. **Add Instagram Graph API as a product** on your Meta for Developers app: developers.facebook.com → My Apps → your app → Add Product → "Instagram Graph API" → Set Up. (Don't follow the "Generate access tokens / Add an Instagram account" subflow — that's for a different IG-direct-login product you don't need.)
 
-4. **Mint a User Access Token** in Graph API Explorer (developers.facebook.com/tools/explorer):
+4. **Mint a short-lived User Access Token** in Graph API Explorer (developers.facebook.com/tools/explorer):
    - Application dropdown (top right) → your app.
    - User or Page Token → **User Access Token**.
-   - Add Permission → check `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`, `instagram_basic`, `instagram_content_publish`, `business_management`.
+   - Add Permission → check `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`, `publish_video`, `instagram_basic`, `instagram_content_publish`.
    - Generate Access Token → sign in with the FB account that admins both the Page and the IG.
-   - **Verify scopes** with `GET /debug_token?input_token={token}&access_token={token}` — `data.scopes` must include all of the above. If `instagram_basic` is missing, you didn't check the box at issuance time; redo step 4.
+   - **Verify scopes** at https://developers.facebook.com/tools/debug/accesstoken/ — the `Scopes` row must include all of the above. Granular Scopes on `instagram_basic` and `instagram_content_publish` must point at your IG Business Account ID.
 
-5. **Convert short-lived → long-lived User Access Token** (~60-day):
+5. **Extend to long-lived User Access Token (~60 days).**
    ```
    GET https://graph.facebook.com/v25.0/oauth/access_token
      ?grant_type=fb_exchange_token
@@ -405,14 +421,19 @@ The code calls the Instagram Graph API via your FB Page Access Token. Setting th
      &client_secret={app-secret}
      &fb_exchange_token={short-lived-user-token}
    ```
+   The `access_token` in the response is your **long-lived User token**. Debug it again — `Type` should be `User`, `Expires` about 60 days out. **Paste this into `IG_USER_ACCESS_TOKEN` in Apps Script Properties.**
 
-6. **Mint a non-expiring Page Access Token** from the long-lived user token:
+6. **Derive a non-expiring Page Access Token** from the same long-lived user token:
    ```
-   GET https://graph.facebook.com/v25.0/me/accounts?fields=name,id,access_token,instagram_business_account{id,username},connected_instagram_account{id,username}
+   GET https://graph.facebook.com/v25.0/me/accounts?fields=name,id,access_token,instagram_business_account{id,username},connected_instagram_account{id,username}&access_token={long-lived-user-token}
    ```
-   In the response, find your Page object → `access_token` is your `FB_PAGE_ACCESS_TOKEN` (set in Apps Script Properties). Page tokens minted from a long-lived user token never expire.
+   In the response, find your Page object → its `access_token` is your Page token. Debug it — `Type` should be `Page`, `Expires` should read `Never`. **Paste this into `FB_PAGE_ACCESS_TOKEN` in Apps Script Properties.**
 
-7. **Confirm IG_USER_ID.** From the same response, your Page object should have `instagram_business_account.id` (or `connected_instagram_account.id` for pages on the New Pages Experience) populated. That value is your `IG_USER_ID`. Paste it into `initScriptProperties()` in `Setup.gs`.
+7. **Confirm IG_USER_ID.** From the same `/me/accounts` response, your Page object should have `instagram_business_account.id` (or `connected_instagram_account.id` for pages on the New Pages Experience) populated. That value is your `IG_USER_ID`. It's already baked into `initScriptProperties()` in `Setup.gs` — update it only if you're pointing this at a different account.
+
+**Rotating just the User token.** Every ~50 days: redo steps 4–5, overwrite `IG_USER_ACCESS_TOKEN` in Script Properties. The Page token (`FB_PAGE_ACCESS_TOKEN`) does NOT need to be touched — it's derived from a *previous* user token but has its own independent lifetime. Only redo step 6 if the Page token also breaks (rare — usually only when the underlying FB account changes password or revokes the app).
+
+**Diagnosing token problems.** See `#Debugging` at the bottom of this file for the failure modes each token produces when misconfigured, plus the exact error codes to grep the Logs column for.
 
 ### 4.5 Instagram aspect-ratio normalization
 
@@ -675,6 +696,20 @@ Send a video. Verify Status flips to `Pending (IG)` after FB success. Verify the
 **Rotate `ORCHESTRATOR_SHARED_SECRET`.** Update both the Apps Script Script Property and the Activepieces env var. Atomic — there's no token version handshake, so update both within a few seconds of each other (or briefly disable the inbound workflow during rotation).
 
 **Roll back to v1.** Deactivate both Activepieces workflows. Apps Script v2/v3 changes are all backward-compatible with the v1 sheet (legacy A-H columns are unchanged); existing form path keeps working.
+
+### 9.1 Debugging Meta tokens {#debugging}
+
+When posting starts failing, first flip `LOG_LEVEL=DEBUG` in Script Properties so per-step diagnostics land in the Logs column, then match the error string below against what shows up.
+
+| Error signature in Logs | What it means | Fix |
+|---|---|---|
+| `(#200) Unpublished posts must be posted to a page as the page itself` on FB photo/video/feed upload | `FB_PAGE_ACCESS_TOKEN` is a User token, not a Page token | Redo §4.4 step 6. The Token Debugger must show `Type: Page` for this property. |
+| `code: 100, subcode: 33, "Authorization Error"` on `GET /{ig-container-id}?fields=status_code` | `IG_USER_ACCESS_TOKEN` is either a Page token, expired, or missing `instagram_basic` | Redo §4.4 steps 4–5. Token Debugger must show `Type: User`, and Granular Scopes must include `instagram_basic` bound to the right IG account ID. |
+| `HTTP 403` on any FB or IG call | Token likely revoked, expired past Data Access Expiration (~90d since last user login), or missing a required scope | Debug the token — if `Valid: False`, regenerate. If `Valid: True`, compare its `Scopes` row against the list in §4.4 step 4. |
+| `code: 9007, subcode: 2207027, "Media is not ready to be published"` on `/media_publish` | Transient race — Meta's publish endpoint hasn't caught up with a just-created container. `publishIgContainer` has a 60-second retry loop, so this should be caught silently. If it surfaces as a real error, the retry timed out — likely means the container itself failed to finalize. | Check the container's `status_code` manually in Graph API Explorer with `IG_USER_ACCESS_TOKEN`. If it's `ERROR` or `EXPIRED`, the underlying image URL (usually wsrv.nl → Drive) was unreachable when Meta tried to fetch it. |
+| Instagram Story fails with `IG container status check error 400` right after main IG post succeeds | Same subcode-33 issue as above, but only visible on the Story path (single-image feed posts don't do a status read; Stories always do) | Same fix — `IG_USER_ACCESS_TOKEN` is wrong or lacks `instagram_basic`. |
+
+**Golden rule:** before assuming code is broken, paste both tokens into the [Token Debugger](https://developers.facebook.com/tools/debug/accesstoken/) and verify: (1) the correct `Type`, (2) all required `Scopes`, (3) `Valid: True`. Most "posting broken" incidents in this project have been one of these three.
 
 ---
 
