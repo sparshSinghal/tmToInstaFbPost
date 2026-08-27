@@ -328,6 +328,17 @@ function handleProcess(body) {
  * Reply: { ok, row_index, status }
  */
 function handleApprove(body) {
+  // Dedup retried deliveries of the same button tap. Telegram redelivers the
+  // same callback_query (same update_id) if it doesn't get a fast 200 — common
+  // under Activepieces queue lag — so one tap can arrive here twice. The
+  // LockService in doPost() serializes the two calls; the first marks the
+  // update_id seen, so the second returns duplicate:true here (and the status
+  // guard below is a second backstop). Returning duplicate lets the AP flow
+  // optionally skip the second "Approved. Posting now..." confirmation.
+  if (body.update_id && updateIdSeen(body.update_id)) {
+    return { ok: true, duplicate: true, noop: true };
+  }
+
   var sheet    = getSheet();
   var rowIndex = findRowByRowId(sheet, body.row_id);
   if (rowIndex === -1) return { ok: false, error: 'row_not_found' };
@@ -339,6 +350,11 @@ function handleApprove(body) {
   if (status !== STATUS.DRAFT && status !== STATUS.AWAITING_EDIT) {
     return { ok: true, row_index: rowIndex, status: status, noop: true };
   }
+
+  // Mark the tap handled before acting. Safe under the doPost LockService —
+  // the first call finishes (incl. this mark) before the retry acquires the
+  // lock, so the retry short-circuits at the dedup check above.
+  if (body.update_id) markUpdateIdSeen(body.update_id);
 
   if (body.edited_caption && body.edited_caption.toString().trim() !== '') {
     sheet.getRange(rowIndex, COL.PCAPTION).setValue(body.edited_caption.toString().trim());
@@ -375,6 +391,11 @@ function handleApprove(body) {
  * Reply: { ok, row_index, status }
  */
 function handleSetStatus(body) {
+  // Dedup retried deliveries of the same Edit-button tap (see handleApprove).
+  if (body.update_id && updateIdSeen(body.update_id)) {
+    return { ok: true, duplicate: true, noop: true };
+  }
+
   var sheet    = getSheet();
   var rowIndex = findRowByRowId(sheet, body.row_id);
   if (rowIndex === -1) return { ok: false, error: 'row_not_found' };
@@ -383,6 +404,7 @@ function handleSetStatus(body) {
   if (allowed.indexOf(body.status) === -1) {
     return { ok: false, error: 'status_not_allowed: ' + body.status };
   }
+  if (body.update_id) markUpdateIdSeen(body.update_id);
   sheet.getRange(rowIndex, COL.STATUS).setValue(body.status);
   appendLog(sheet, rowIndex, 'Status set to ' + body.status + ' by Activepieces.');
   return { ok: true, row_index: rowIndex, status: body.status };

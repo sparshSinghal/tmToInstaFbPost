@@ -277,24 +277,17 @@ For each Send Message:
 
 #### 5b — Branch `approve`
 
-**Step 5b-1 — Telegram Bot · Answer Callback Query** (dismisses the loading spinner on the button)
+> **Do NOT add an "Answer Callback Query" step.** Telegram callback-query IDs
+> expire ~15 seconds after the button tap. On AP free tier, the inbound run
+> is often queued and doesn't start until well after that, so
+> `answerCallbackQuery` returns `400 "query is too old ... or query ID is
+> invalid"`. That call is purely cosmetic (it clears the little spinner on the
+> tapped button; Telegram auto-clears it after a few seconds anyway) — and if
+> it runs first and AP stops on error, it can abort the whole branch so the
+> approval never happens. Skip it entirely; the Send Message below is the
+> user's confirmation.
 
-| Field | Value |
-|---|---|
-| Callback Query ID | `{{step1.callbackQueryId}}` |
-| Text | (leave empty) |
-| Show Alert | false |
-
-If your AP version doesn't have an "Answer Callback Query" action, replace this step with a plain HTTP POST:
-
-| Field | Value |
-|---|---|
-| Method | `POST` |
-| URL | `https://api.telegram.org/bot<BOT_TOKEN>/answerCallbackQuery` |
-| Body Type | JSON |
-| Body | `{ "callback_query_id": "{{step1.callbackQueryId}}" }` |
-
-**Step 5b-2 — HTTP**
+**Step 5b-1 — HTTP** (the actual approve — run this first so a stale callback never blocks it)
 
 | Field | Value |
 |---|---|
@@ -313,26 +306,20 @@ If your AP version doesn't have an "Answer Callback Query" action, replace this 
 }
 ```
 
-**Step 5b-3 — Telegram Bot · Send Message**
+**Step 5b-2 — Telegram Bot · Send Message**
 
 | Field | Value |
 |---|---|
 | Chat ID | `{{step1.chatId}}` |
 | Text | `Approved. Posting now...` |
 
-(If Apps Script returns `noop: true` — meaning the row was already past the approval state — the message still sends. Harmless; the user knows their tap registered.)
+**Duplicate taps:** Telegram redelivers the same `callback_query` (same `update_id`) if it doesn't get a fast 200 — common under AP queue lag — so one Approve tap can reach Apps Script twice. Apps Script dedups on `update_id`: the first call approves and posts; the second returns `{ "ok": true, "duplicate": true, "noop": true }` and does nothing (posting is safe either way — LockService + status guard prevent double-posts). To suppress the duplicate "Approved. Posting now..." confirmation, wrap this Send Message in a Router branch: **Field** `{{step5b_1.body.duplicate}}`, **Operator** `(Boolean) Is true` → leave that branch empty; put the Send Message in the else/default branch. If you skip that, the worst case is one extra confirmation message — harmless.
 
 #### 5c — Branch `edit`
 
-**Step 5c-1 — Telegram Bot · Answer Callback Query** (same setup as Step 5b-1)
+> Same as 5b: **no Answer Callback Query step** (see the note above).
 
-| Field | Value |
-|---|---|
-| Callback Query ID | `{{step1.callbackQueryId}}` |
-| Text | (leave empty) |
-| Show Alert | false |
-
-**Step 5c-2 — HTTP**
+**Step 5c-1 — HTTP**
 
 | Field | Value |
 |---|---|
@@ -347,11 +334,12 @@ If your AP version doesn't have an "Answer Callback Query" action, replace this 
   "token": "<SHARED_SECRET>",
   "action": "setStatus",
   "row_id": "{{step4.rowId}}",
-  "status": "Awaiting Edit"
+  "status": "Awaiting Edit",
+  "update_id": "{{step1.updateId}}"
 }
 ```
 
-**Step 5c-3 — Telegram Bot · Send Message**
+**Step 5c-2 — Telegram Bot · Send Message**
 
 | Field | Value |
 |---|---|
