@@ -164,6 +164,21 @@ function generateCaptionAndHeadline(rawCaption, sheet, rowIndex) {
     '- कोई भी नया नाम, स्थान, समस्या, योजना या घटना मत जोड़ो।\n' +
     '- नाम और स्थान बिल्कुल वैसे ही लिखो जैसे input में हैं — spelling या नाम मत बदलो।\n\n' +
 
+    'श्रीमती लीना सिंघल का नाम — यह Hallucination नहीं है (बहुत महत्वपूर्ण):\n' +
+    '- यह अकाउंट श्रीमती लीना सिंघल का है। इसलिए उनका नाम output में शामिल करना ' +
+    'hallucination नहीं माना जाएगा — यह persona है, कोई नया तथ्य नहीं।\n' +
+    '- ऊपर दिया गया "नया नाम मत जोड़ो" नियम केवल अन्य व्यक्तियों, स्थानों, घटनाओं, ' +
+    'योजनाओं और तथ्यों पर लागू होता है — श्रीमती लीना सिंघल पर नहीं।\n' +
+    '- दो स्थितियाँ हो सकती हैं:\n' +
+    '  (a) अगर input में श्रीमती लीना सिंघल की कोई गतिविधि/कार्यक्रम है → उसी को ' +
+    'तीसरे व्यक्ति में लिखो ("श्रीमती लीना सिंघल ने ...")।\n' +
+    '  (b) अगर input एक सामान्य घोषणा, योजना, या खबर है जिसमें उनका नाम नहीं है → ' +
+    'उसे इस रूप में लिखो कि श्रीमती लीना सिंघल यह जानकारी साझा कर रही हैं या इसका ' +
+    'स्वागत कर रही हैं (जैसे "श्रीमती लीना सिंघल ने बताया कि ..." / ' +
+    '"श्रीमती लीना सिंघल ने इस पहल का स्वागत करते हुए कहा कि ...")। input के तथ्य ' +
+    'वैसे ही रखो — केवल उन्हें उनकी आवाज़ में frame करो।\n' +
+    '- किसी भी हालत में देर तक असमंजस मत करो — नियम स्पष्ट है, सीधे output लिखो।\n\n' +
+
     'Input Handling Logic:\n' +
     '- अगर input पहले से ही detailed है → उसे साफ, structured और readable बनाओ (सिर्फ सुधार करो, जानकारी मत हटाओ)\n' +
     '- अगर input छोटा या incomplete है → उसी जानकारी को logically arrange करके meaningful caption बनाओ\n\n' +
@@ -225,7 +240,10 @@ function generateCaptionAndHeadline(rawCaption, sheet, rowIndex) {
   try {
     parsed = JSON.parse(cleaned);
   } catch (e) {
-    throw new Error('Sarvam response was not valid JSON. Raw response: ' + raw);
+    // Truncate the raw output in the error so a long/half-written response
+    // doesn't flood the Logs column. First 400 chars is enough to diagnose.
+    var preview = raw.length > 400 ? raw.substring(0, 400) + '… [' + raw.length + ' chars total]' : raw;
+    throw new Error('Sarvam response was not valid JSON. Raw (truncated): ' + preview);
   }
 
   if (!parsed.caption || !parsed.headline) {
@@ -286,14 +304,30 @@ function callSarvamAPI(systemPrompt, userPrompt, logFn) {
   // truncated JSON, or `content: null`). 8192 gives plenty of headroom for
   // both reasoning and output even on the long detailed prompts; raise
   // further if the prompts grow.
-  var payload = JSON.stringify({
+  // Root-cause fix for "reasoning ate the whole budget": ask Sarvam to reduce
+  // or skip its chain-of-thought. sarvam-105b is a reasoning model; the
+  // thinking is generated server-side and counts against max_tokens.
+  //
+  // NOTE: this parameter is UNVERIFIED for Sarvam's current API. If Sarvam
+  // rejects it you'll see "Sarvam API error 400" mentioning an unknown/invalid
+  // parameter on the next post — in that case set SARVAM_REASONING_EFFORT to
+  // null below to drop the field, and rely on max_tokens=8192 + the
+  // de-conflicted prompt instead. Candidate values if 'low' is rejected:
+  // 'none', 'minimal', or omit entirely.
+  var SARVAM_REASONING_EFFORT = 'low';   // set to null to omit the field
+
+  var payloadObj = {
     model:      SARVAM_MODEL,
-    max_tokens: 4096,
+    max_tokens: 8192,
     messages:   [
       { role: 'system', content: systemPrompt },
       { role: 'user',   content: userPrompt   }
     ]
-  });
+  };
+  if (SARVAM_REASONING_EFFORT) {
+    payloadObj.reasoning_effort = SARVAM_REASONING_EFFORT;
+  }
+  var payload = JSON.stringify(payloadObj);
 
   var options = {
     method:           'post',
@@ -306,7 +340,7 @@ function callSarvamAPI(systemPrompt, userPrompt, logFn) {
   dbg('request → model=' + SARVAM_MODEL +
       ', system=' + systemPrompt.length + ' chars' +
       ', user=' + userPrompt.length + ' chars' +
-      ', max_tokens=4096.');
+      ', max_tokens=8192.');
 
   var startMs  = Date.now();
   var response = UrlFetchApp.fetch(SARVAM_API_URL, options);
@@ -327,13 +361,25 @@ function callSarvamAPI(systemPrompt, userPrompt, logFn) {
 
   var content = json.choices[0].message.content;
   if (content === null || content === undefined) {
-    // Can happen when the model returns a reasoning-only response with no content.
-    // The finish_reason is usually "stop" but content is null. Treat as retryable.
+    // Model returned reasoning-only with no output — usually finish_reason
+    // 'length' when the reasoning_content ate the whole token budget. We log
+    // CONCISE diagnostics (finish_reason + token usage) rather than dumping
+    // the full response body, which contains a multi-thousand-token
+    // reasoning_content blob that floods the row's Logs column.
     var finishReason = (json.choices[0].finish_reason || 'unknown');
-    dbg('error → null content (finish_reason=' + finishReason + ', ' + durMs + ' ms).');
+    var usage        = json.usage || {};
+    var reasoningLen = (json.choices[0].message.reasoning_content || '').length;
+    var diag =
+      'finish_reason=' + finishReason +
+      ', completion_tokens=' + (usage.completion_tokens != null ? usage.completion_tokens : '?') +
+      ', prompt_tokens=' + (usage.prompt_tokens != null ? usage.prompt_tokens : '?') +
+      ', reasoning_content=' + reasoningLen + ' chars (discarded)';
+    dbg('error → null content (' + diag + ', ' + durMs + ' ms).');
     throw new Error(
-      'Sarvam API returned null content (finish_reason: ' + finishReason + '). ' +
-      'Full response: ' + body);
+      'Sarvam API returned null content — the model spent its whole token ' +
+      'budget on reasoning and produced no output. ' + diag +
+      '. Fix: raise max_tokens, simplify/de-conflict the prompt, or disable ' +
+      'reasoning mode.');
   }
 
   var trimmed = content.toString().trim();
