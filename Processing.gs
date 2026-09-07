@@ -120,6 +120,75 @@ function processRow(sheet, rowIndex) {
   }
 }
 
+/**
+ * MANUAL RECOVERY — run this from the Apps Script editor when a row is stuck
+ * at "Error" (e.g. Sarvam failed at processing time). Select `retryErrorRows`
+ * in the function dropdown → click ▶ Run.
+ *
+ * What it does, for every row currently at Status = "Error":
+ *   1. Clears the poll-driven flags (Approval_Requested / Reminder_Sent /
+ *      Confirmation_Sent) and the Error_Message cell, so the row flows back
+ *      through the normal approval-card + confirmation path once recovered.
+ *      (An Error row may already have received a "posting failed" Telegram
+ *      confirmation, which set Confirmation_Sent = TRUE — resetting it lets
+ *      the success message send later.)
+ *   2. Re-runs processRow(), which resets Status to Processing, calls Sarvam
+ *      again, and flips the row to Draft on success (or back to Error if it
+ *      fails again — e.g. a row with a genuinely empty caption).
+ *
+ * After a successful run, recovered rows go to Draft; within ~1 polling cycle
+ * the Activepieces polling flow sends the Telegram approval card as usual.
+ *
+ * Logs a one-line summary to the Executions panel:
+ *   retryErrorRows: attempted N, recovered→Draft M, still failing K
+ *
+ * @returns {{ attempted: number, recovered: number, stillError: number }}
+ */
+function retryErrorRows() {
+  var sheet   = getSheet();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('retryErrorRows: no data rows.');
+    return { attempted: 0, recovered: 0, stillError: 0 };
+  }
+
+  var statuses = sheet.getRange(2, COL.STATUS, lastRow - 1, 1).getValues();
+  var lastCol  = sheet.getLastColumn();
+  var attempted = 0, recovered = 0, stillError = 0;
+
+  for (var i = 0; i < statuses.length; i++) {
+    if (statuses[i][0] !== STATUS.ERROR) continue;
+    var rowIndex = i + 2;
+    attempted++;
+
+    // Reset poll-driven flags + clear the old error so a recovered row behaves
+    // like a fresh Draft (gets a new approval card and, eventually, a success
+    // confirmation).
+    if (lastCol >= COL.CONFIRMATION_SENT) {
+      sheet.getRange(rowIndex, COL.APPROVAL_REQUESTED).setValue('FALSE');
+      sheet.getRange(rowIndex, COL.REMINDER_SENT).setValue('FALSE');
+      sheet.getRange(rowIndex, COL.CONFIRMATION_SENT).setValue('FALSE');
+    }
+    if (lastCol >= COL.ERROR_MESSAGE) {
+      sheet.getRange(rowIndex, COL.ERROR_MESSAGE).setValue('');
+    }
+
+    try {
+      processRow(sheet, rowIndex);   // Error is not in processRow's busyOrDone guard, so it re-runs
+    } catch (e) {
+      appendLog(sheet, rowIndex, 'Manual Sarvam retry threw: ' + e.message);
+    }
+
+    var newStatus = sheet.getRange(rowIndex, COL.STATUS).getValue().toString();
+    if (newStatus === STATUS.DRAFT) recovered++;
+    else stillError++;
+  }
+
+  Logger.log('retryErrorRows: attempted ' + attempted +
+    ', recovered→Draft ' + recovered + ', still failing ' + stillError);
+  return { attempted: attempted, recovered: recovered, stillError: stillError };
+}
+
 // ── Sarvam AI helpers ─────────────────────────────────────────
 
 /**
@@ -296,38 +365,20 @@ function callSarvamAPI(systemPrompt, userPrompt, logFn) {
     }
   }
 
-  // max_tokens caps the COMPLETION budget (reasoning + actual output, both
-  // counted). Sarvam's default is 2048 which is too tight for sarvam-105b
-  // in reasoning mode — the model burns ~1500-2000 tokens on internal
-  // chain-of-thought (visible in `reasoning_content`) before writing the
-  // JSON, often hitting the cap mid-output (`finish_reason: 'length'`,
-  // truncated JSON, or `content: null`). 8192 gives plenty of headroom for
-  // both reasoning and output even on the long detailed prompts; raise
-  // further if the prompts grow.
-  // Root-cause fix for "reasoning ate the whole budget": ask Sarvam to reduce
-  // or skip its chain-of-thought. sarvam-105b is a reasoning model; the
-  // thinking is generated server-side and counts against max_tokens.
-  //
-  // NOTE: this parameter is UNVERIFIED for Sarvam's current API. If Sarvam
-  // rejects it you'll see "Sarvam API error 400" mentioning an unknown/invalid
-  // parameter on the next post — in that case set SARVAM_REASONING_EFFORT to
-  // null below to drop the field, and rely on max_tokens=8192 + the
-  // de-conflicted prompt instead. Candidate values if 'low' is rejected:
-  // 'none', 'minimal', or omit entirely.
-  var SARVAM_REASONING_EFFORT = 'low';   // set to null to omit the field
-
-  var payloadObj = {
+  // max_tokens caps the completion budget. On the non-reasoning
+  // 'sarvam-105b-conversations' model (set in Config.gs) the output is just
+  // the caption+headline JSON — a few hundred tokens — so 8192 is generous
+  // headroom. (The reasoning-model 'sarvam-105b' used to blow this cap with
+  // thousands of tokens of chain-of-thought; the conversational model answers
+  // directly and doesn't have that failure mode.)
+  var payload = JSON.stringify({
     model:      SARVAM_MODEL,
     max_tokens: 8192,
     messages:   [
       { role: 'system', content: systemPrompt },
       { role: 'user',   content: userPrompt   }
     ]
-  };
-  if (SARVAM_REASONING_EFFORT) {
-    payloadObj.reasoning_effort = SARVAM_REASONING_EFFORT;
-  }
-  var payload = JSON.stringify(payloadObj);
+  });
 
   var options = {
     method:           'post',

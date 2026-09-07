@@ -28,7 +28,9 @@
  *   add_to_draft        — create a new Collecting row OR append text/media to
  *                         an in-flight one. The unified entry point that the
  *                         Activepieces inbound flow calls for every new-content
- *                         message. Includes update_id dedup automatically.
+ *                         message. Media is passed as a Telegram file_url and
+ *                         downloaded to Drive here (see downloadTelegramFileToDrive).
+ *                         Includes update_id dedup automatically.
  *   finalize_collecting — flip a Collecting row to New and run Sarvam.
  *                         Called by the polling flow once the collect window
  *                         expires.
@@ -132,7 +134,14 @@ function doGet(e) {
  * once the row's Timestamp is older than COLLECT_WINDOW_SECONDS, which kicks
  * off Sarvam.
  *
- * Body:  { telegram_user_id, text?, media_url?, update_id? }
+ * Media handling: Activepieces passes the Telegram `file_url` (+ `file_path`
+ * for naming/MIME) rather than a pre-hosted URL, because AP's Drive Upload
+ * piece can't store the file (it rejects URL and data-URI strings). This
+ * function downloads the file_url into the Drive folder itself and uses the
+ * resulting Drive URL as the media_url. `media_url` is still accepted directly
+ * for backward compatibility / the Google Form path.
+ *
+ * Body:  { telegram_user_id, text?, file_url?, file_path?, media_url?, update_id? }
  * Reply: { ok, row_id, action: 'appended'|'created'|'deduped'|'edited_and_posted', status? }
  */
 function handleAddToDraft(body) {
@@ -176,6 +185,14 @@ function handleAddToDraft(body) {
         status: finalStatus
       };
     }
+  }
+
+  // ── Download Telegram media into Drive ───────────────────────
+  // Activepieces passes the raw Telegram file_url; download it here and
+  // store it in the Drive folder (AP's Drive Upload piece can't do it).
+  // The resulting Drive URL then flows through the normal media logic.
+  if (body.file_url && !body.media_url) {
+    body.media_url = downloadTelegramFileToDrive(body.file_url, body.file_path);
   }
 
   var collectIdx = findCollectingRowForUser(sheet, telegramId);
@@ -240,6 +257,86 @@ function handleAddToDraft(body) {
 
   if (body.update_id) markUpdateIdSeen(body.update_id);
   return { ok: true, action: 'created', row_id: rowId, row_index: newRowIndex };
+}
+
+/**
+ * Downloads a Telegram file (via its temporary getFile download URL) and
+ * stores it in the TELEGRAM_DRIVE_FOLDER, returning a Drive view URL in the
+ * same /file/d/{id}/view format the rest of the pipeline parses.
+ *
+ * Why Apps Script does this rather than Activepieces: AP's Google Drive
+ * "Upload File" piece only accepts a native AP file object as its file input.
+ * This AP version's Telegram "Get File" piece returns base64 (or a plain URL),
+ * and the Upload piece silently rejects both a URL string and a data-URI
+ * string — it creates an empty "Untitled" application/octet-stream file. Apps
+ * Script already owns the Drive folder and holds the drive OAuth scope, so it
+ * fetches the bytes with UrlFetchApp and writes them directly.
+ *
+ * Telegram download URLs (https://api.telegram.org/file/bot<token>/<path>)
+ * stay valid ~1 hour, which is far longer than the AP→Apps Script hop.
+ * UrlFetchApp handles files up to 50 MB, covering Telegram's own bot-download
+ * cap (20 MB for getFile, so always within range).
+ *
+ * @param {string} fileUrl  - Telegram getFile download URL
+ * @param {string} filePath - Telegram file_path (used to derive name + MIME)
+ * @returns {string} Drive view URL: https://drive.google.com/file/d/{id}/view
+ * @throws if the folder isn't configured or the fetch/store fails
+ */
+function downloadTelegramFileToDrive(fileUrl, filePath) {
+  var folderId = getTelegramDriveFolderId();
+  if (!folderId || folderId === 'PASTE_DRIVE_FOLDER_ID_OR_LEAVE_BLANK') {
+    throw new Error('TELEGRAM_DRIVE_FOLDER_ID is not set; cannot store Telegram media.');
+  }
+
+  var resp = withRetry(function () {
+    var r = UrlFetchApp.fetch(fileUrl, { muteHttpExceptions: true });
+    if (r.getResponseCode() !== 200) {
+      throw new Error('Telegram file fetch returned HTTP ' + r.getResponseCode());
+    }
+    return r;
+  });
+
+  var blob = resp.getBlob();
+
+  // Derive a name + MIME type from the Telegram file_path extension. Telegram
+  // paths look like "photos/file_123.jpg" or "videos/file_45.mp4"; fall back
+  // to a generic binary name when there's no usable extension.
+  var ext  = '';
+  var base = 'telegram_media';
+  if (filePath) {
+    var slash = filePath.lastIndexOf('/');
+    var leaf  = slash === -1 ? filePath : filePath.substring(slash + 1);
+    if (leaf) base = leaf;
+    var dot = leaf.lastIndexOf('.');
+    if (dot !== -1) ext = leaf.substring(dot + 1).toLowerCase();
+  }
+
+  var mime = telegramExtToMime(ext);
+  if (mime) blob.setContentType(mime);
+  blob.setName(base);
+
+  var file = DriveApp.getFolderById(folderId).createFile(blob);
+  return 'https://drive.google.com/file/d/' + file.getId() + '/view';
+}
+
+/**
+ * Maps a lowercase file extension to a MIME type for the media we accept.
+ * Returns '' for unknown extensions so the caller keeps the blob's default.
+ * @param {string} ext
+ * @returns {string}
+ */
+function telegramExtToMime(ext) {
+  switch (ext) {
+    case 'jpg':
+    case 'jpeg': return 'image/jpeg';
+    case 'png':  return 'image/png';
+    case 'gif':  return 'image/gif';
+    case 'webp': return 'image/webp';
+    case 'heic': return 'image/heic';
+    case 'mp4':  return 'video/mp4';
+    case 'mov':  return 'video/quicktime';
+    default:     return '';
+  }
 }
 
 /**

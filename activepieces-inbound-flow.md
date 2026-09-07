@@ -8,7 +8,13 @@ Build this in Activepieces Cloud (cloud.activepieces.com). When done, hit **Sett
 |---|---|---|
 | Telegram Bot | `@activepieces/piece-telegram-bot` | Paste BotFather token |
 | Google Sheets | `@activepieces/piece-google-sheets` | OAuth (sign in with Google account that owns the sheet) |
-| Google Drive | `@activepieces/piece-google-drive` | Same Google account; scope must include drive.file |
+
+> **No Google Drive connection needed.** Media is no longer uploaded to Drive
+> by Activepieces — AP's Drive Upload piece can't store the file (it makes an
+> empty "Untitled" file from any string input). Instead this flow passes the
+> raw Telegram `file_url` to Apps Script, and Apps Script downloads it into the
+> Drive folder itself (it owns the folder and holds the Drive OAuth scope). See
+> `downloadTelegramFileToDrive` in `Telegram.gs`.
 
 ## Critical settings (apply to every step of the matching type)
 
@@ -20,7 +26,7 @@ Every HTTP step in this flow that targets `<WEBAPP_URL>` needs **Follow Redirect
 
 If your AP version has no such toggle, replace each Apps Script POST with a two-step pair: one POST that captures the 302, one GET to `{{<post_step>.headers.location}}` that fetches the JSON. Reference the GET step's output downstream instead of the POST step's.
 
-The HTTP GET to Telegram's CDN (Step 3a-2) doesn't need this setting — it's a single hop with no redirect.
+(There's no HTTP GET to Telegram's CDN in this flow — the media download happens inside Apps Script, not Activepieces.)
 
 ### 2. Parse Mode — every Telegram Bot · Send Message
 
@@ -38,8 +44,11 @@ The Activepieces free tier does not expose flow-level variables. Keep this table
 |---|---|---|
 | `<WEBAPP_URL>` | `https://script.google.com/macros/s/AKfy.../exec` | URL field of every HTTP step |
 | `<SHARED_SECRET>` | 32+ char random string matching Apps Script Property `ORCHESTRATOR_SHARED_SECRET` | `token` field of every HTTP body |
-| `<TELEGRAM_DRIVE_FOLDER_ID>` | Drive folder id (string) | Folder field of the Google Drive · Upload File step |
 | `<WHITELIST>` | Comma-separated Telegram user ids, e.g. `26555995744020286` | **Hard-code inside the Step 1 Code piece** (see code block below — replace the inputs binding with a literal array) |
+
+> The Drive folder id is **not** pasted anywhere in Activepieces anymore. It
+> lives only as the Apps Script Script Property `TELEGRAM_DRIVE_FOLDER_ID`,
+> which `downloadTelegramFileToDrive` reads when storing media.
 
 ## Steps
 
@@ -148,39 +157,30 @@ Use AP's **Router → Branch**:
 - **Field:** `{{step1.hasMedia}}`
 - **Operator:** `(Boolean) Is true`
 
-The **else / default** path is the no-media case — let it skip to Step 4 with no Drive upload.
+The **else / default** path is the no-media case — let it skip to Step 4.
 
 #### 3a — Has media (the `Is true` branch):
 
-1. **Telegram Bot · Get File** with `file_id = {{step1.mediaFileId}}` → returns an object shaped:
-   ```json
-   {
-     "file_info": { "file_id": "...", "file_path": "videos/file_3.MP4", "file_size": ... },
-     "file_url":  "https://api.telegram.org/file/bot<TOKEN>/videos/file_3.MP4"
-   }
-   ```
-   Note `file_url` already has your bot token embedded — no manual URL construction needed in the next step.
+**One step only — Telegram Bot · Get File.**
 
-2. **Google Drive · Upload File** — pass the URL directly; AP's Drive Upload fetches it server-side and uploads the result. **Do not insert an HTTP GET step in between** (Drive Upload rejects raw binary streams with `Expected file url or base64 with mimeType, received: <binary>`).
-   - **File**: `{{<get_file_step>.file_url}}` — bind the **top-level** `file_url` field via the magic-wand picker (NOT inside `file_info`). The Telegram URL has the bot token embedded in its path, so AP's anonymous fetch succeeds.
-   - **Folder**: paste your `<TELEGRAM_DRIVE_FOLDER_ID>` literally, or use the Drive folder picker.
-   - **File name**: use any sensible string — Apps Script reads the actual MIME type from Drive at post time, so the filename extension is just a hint. A safe template: `tg_{{step1.updateId}}_{{step1.mediaType}}` (e.g. `tg_42_photo`, `tg_43_video`).
+- **File ID:** `{{step1.mediaFileId}}`
+- **Download file:** leave **`false`**. We don't need the bytes in Activepieces — Apps Script fetches them. (If your AP version always downloads, `true` is harmless; we just ignore `file_content_base64`.)
 
-3. **Code · Build Drive URL**:
+The output exposes the file's temporary download URL and its Telegram path:
+```json
+{
+  "file_info": { "file_id": "...", "file_path": "photos/file_560.jpg", "file_size": 175828 },
+  "file_url":  "https://api.telegram.org/file/bot<TOKEN>/photos/file_560.jpg"
+}
+```
 
-   **Inputs panel** (required):
+We pass `file_url` and `file_info.file_path` straight through to Apps Script (Steps 4 and 5a-1). Apps Script's `downloadTelegramFileToDrive` fetches `file_url` with `UrlFetchApp`, derives the name/MIME from `file_path`, writes the file into the Drive folder, and hands the normal pipeline a `https://drive.google.com/file/d/{id}/view` URL. **No Code steps and no Drive Upload step here anymore.**
 
-   | Name | Value |
-   |---|---|
-   | `fileId` | `{{<your_drive_upload_step_name>.id}}` — the `id` field returned by the Google Drive · Upload File step |
+> These Telegram download URLs stay valid ~1 hour, far longer than the AP→Apps
+> Script hop, so no race. Telegram's `getFile` caps bot downloads at 20 MB,
+> well within `UrlFetchApp`'s 50 MB limit.
 
-   ```javascript
-   exports.code = async ({ fileId }) => {
-     return { mediaUrl: `https://drive.google.com/file/d/${fileId}/view` };
-   };
-   ```
-
-#### 3b — No media (the else / default branch): skip the four steps above; `mediaUrl` will be empty string in Step 4.
+#### 3b — No media (the else / default branch): no steps; `file_url` / `file_path` resolve to empty string in Step 4, and Apps Script skips the download.
 
 ### Step 4 — Code · State router
 
@@ -191,10 +191,11 @@ Piece: **Code**.
 | Name | Value |
 |---|---|
 | `step1` | `{{<your_step_1_name>}}` — pick the whole output of the Step 1 Code piece (whatever you renamed it to; AP shows it in the magic-wand picker) |
-| `mediaUrl` | `{{<your_step_3a_4_name>.mediaUrl}}` — the `mediaUrl` field from the Build-Drive-URL step inside the has-media branch. Resolves to empty string when the no-media branch fired. |
+| `fileUrl` | `{{<your_get_file_step>.file_url}}` — the `file_url` from the Get File step (Step 3a). Resolves to empty string when the no-media branch fired. |
+| `filePath` | `{{<your_get_file_step>.file_info.file_path}}` — the Telegram file path (used by Apps Script for naming + MIME). Empty when no media. |
 
 ```javascript
-exports.code = async ({ step1, mediaUrl }) => {
+exports.code = async ({ step1, fileUrl, filePath }) => {
   const text = (step1.text || step1.caption || '').trim();
   const cb   = step1.callbackData || '';
 
@@ -206,8 +207,8 @@ exports.code = async ({ step1, mediaUrl }) => {
     const colonIdx = cb.indexOf(':');
     const action   = colonIdx === -1 ? cb : cb.substring(0, colonIdx);
     const rowId    = colonIdx === -1 ? '' : cb.substring(colonIdx + 1);
-    if (action === 'approve') return { route: 'approve', text, rowId, mediaUrl: '' };
-    if (action === 'edit')    return { route: 'edit',    text, rowId, mediaUrl: '' };
+    if (action === 'approve') return { route: 'approve', text, rowId, fileUrl: '', filePath: '' };
+    if (action === 'edit')    return { route: 'edit',    text, rowId, fileUrl: '', filePath: '' };
   }
 
   // Everything else (text, media, or both) goes to add_to_draft. Apps Script's
@@ -215,8 +216,9 @@ exports.code = async ({ step1, mediaUrl }) => {
   // a row in 'Awaiting Edit' status (set by a prior Edit-button tap) and the
   // incoming text is non-empty, it applies the text to PCaption and posts
   // immediately, returning action:'edited_and_posted'. Otherwise it falls
-  // through to the normal Collecting / new-draft path.
-  return { route: 'add_to_draft', text, mediaUrl, rowId: '' };
+  // through to the normal Collecting / new-draft path. When media is present,
+  // Apps Script downloads fileUrl into Drive itself.
+  return { route: 'add_to_draft', text, fileUrl: fileUrl || '', filePath: filePath || '', rowId: '' };
 };
 ```
 
@@ -249,10 +251,16 @@ This is the most common path: a user is sending content (text and/or media) for 
   "action": "add_to_draft",
   "telegram_user_id": "{{step1.fromId}}",
   "text": "{{step4.text}}",
-  "media_url": "{{step4.mediaUrl}}",
+  "file_url": "{{step4.fileUrl}}",
+  "file_path": "{{step4.filePath}}",
   "update_id": "{{step1.updateId}}"
 }
 ```
+
+Apps Script downloads `file_url` into the Drive folder and records the Drive URL
+as the row's media. When `file_url` is empty (no-media message), it's a
+text-only draft. (`media_url` is still accepted as an alternative to `file_url`
+for the Google Form path, but the Telegram flow uses `file_url`.)
 
 **Step 5a-2 — Router · acknowledge based on Apps Script's response**
 

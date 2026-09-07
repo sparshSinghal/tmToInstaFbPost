@@ -60,7 +60,7 @@ Anyone who needs to publish regularly to Facebook/Instagram from a team in the f
 4. **Run `setup()`** to install all time-based triggers.
 5. **Deploy as Web App** (Execute as: Me, Who has access: Anyone). Copy the `/exec` URL — this is your `APPS_SCRIPT_URL`.
 6. **Create a Telegram bot** via `@BotFather`. Note the token.
-7. **Create an Activepieces Cloud account** and add connections for Telegram Bot, Google Sheets, and Google Drive.
+7. **Create an Activepieces Cloud account** and add connections for Telegram Bot and Google Sheets. (No Google Drive connection needed — Apps Script handles media downloads to Drive itself.)
 8. **Build the inbound flow** following `activepieces-inbound-flow.md`. Paste `<WEBAPP_URL>`, `<SHARED_SECRET>`, and your whitelist inline.
 9. **Build the polling flow** following `activepieces-polling-flow.md`.
 10. *(Optional)* Build the writer bot flow following `activepieces-writer-flow.md`.
@@ -146,13 +146,15 @@ The Apps Script remains the source of truth for caption generation and FB/IG pos
 
 A Telegram-sourced row and a form-sourced row are distinguished by whether column J (`Telegram_User_Id`) is populated. The polling workflow keys on this — form rows are ignored by the Telegram confirmation logic, and Telegram rows skip the email reviewer notification (`sendDraftNotification` is gated on the absence of a WA number — see `Processing.gs`).
 
-### 2.2 Media handling — Google Drive links, not Form upload
+### 2.2 Media handling — Apps Script downloads to Drive, not Form upload
 
-**Decision:** Activepieces downloads the Telegram media binary, uploads it to a configured Drive folder, and writes the Drive URL into column C in the same `https://drive.google.com/file/d/{id}/view` format the existing `extractAllDriveFileIds()` already parses.
+**Decision:** Activepieces passes the raw Telegram `file_url` (plus `file_path`) to the `add_to_draft` endpoint. Apps Script's `downloadTelegramFileToDrive()` fetches the bytes with `UrlFetchApp`, writes the file into the configured Drive folder, and stores the resulting `https://drive.google.com/file/d/{id}/view` URL in column C — the same format the existing `extractAllDriveFileIds()` already parses.
 
-**Why:** The Forms upload field requires an authenticated Google session — there is no public API for it, and headless submission (cookies, hidden form fields) is brittle. Direct Drive upload via Activepieces's Google Drive node is officially supported, faster, and auditable. The downstream code is unchanged because `extractAllDriveFileIds()` already handles arbitrary Drive URLs.
+**Why not the Forms upload field:** it requires an authenticated Google session — there is no public API, and headless submission is brittle.
 
-A hidden bonus: Telegram's media URLs **expire in roughly 5 minutes**. Activepieces downloads immediately on receipt, so by the time Apps Script needs the file, it's safely on Drive with no expiry.
+**Why Apps Script and not Activepieces's Drive node:** AP's Google Drive "Upload File" piece only accepts a native AP file object. This AP version's Telegram "Get File" piece yields base64 or a plain URL, and the Upload piece silently rejects both — it creates an empty "Untitled" `application/octet-stream` file. Apps Script already owns the Drive folder and holds the `drive` OAuth scope, so it does the fetch + store directly and reliably. No Google Drive connection is needed in Activepieces anymore.
+
+**Timing:** Telegram's `getFile` download URLs stay valid ~1 hour — far longer than the Activepieces→Apps Script hop — so there's no expiry race. `getFile` caps bot downloads at 20 MB (within `UrlFetchApp`'s 50 MB limit); media larger than 20 MB can't be retrieved through the Bot API at all.
 
 ### 2.3 Form strategy — keep for backward compatibility, bypass for Telegram
 
@@ -371,8 +373,9 @@ You will need:
 2. **Create connections** (Connections → Add):
    - **Telegram Bot** — paste the BotFather token from §4.2.1.
    - **Google Sheets** — OAuth, log in with the Google account that owns the spreadsheet.
-   - **Google Drive** — OAuth, same account, scope must include `drive.file`.
    - **HTTP** — no auth needed; the shared secret travels in request bodies.
+
+   (No **Google Drive** connection — Apps Script downloads Telegram media to Drive itself via `downloadTelegramFileToDrive()`. See §2.2.)
 
 3. **Build the inbound flow.** Follow `activepieces-inbound-flow.md` step by step. **Free tier note:** Activepieces' free plan does not expose a flow-level Variables tab — the spec instead tells you to paste each value (`<WEBAPP_URL>`, `<SHARED_SECRET>`, `<TELEGRAM_DRIVE_FOLDER_ID>`) literally into the relevant step, and to hard-code the whitelist directly inside the Step 1 Code piece.
 
@@ -640,7 +643,7 @@ Send a video. Verify Status flips to `Pending (IG)` after FB success. Verify the
 | Multiple open drafts per user | `processRow` calls `supersedeOlderDrafts()` before flipping a new draft to `Draft` — older Draft / Awaiting Edit rows for the same WA number become `Superseded` and are skipped by the polling sweeps. |
 | "1"/"2" with no open draft | State Router emits a `no_draft_command` branch that sends a polite "no draft awaiting" reply instead of creating a row. |
 | Text-mode "1"/"2" replies are clunky | Approval card now uses Telegram interactive buttons (Approve & Post / Edit Caption). Inbound parse handles `interactive.button_reply.id`, and falls back to text "1"/"2"/"approve"/"edit" for clients that don't render buttons. |
-| No retry on transient HTTP errors | Every Activepieces HTTP Request, Google Sheets, and Google Drive node has `retryOnFail: true, maxTries: 3, waitBetweenTries: 2000`. |
+| No retry on transient HTTP errors | Every Activepieces HTTP Request and Google Sheets node has `retryOnFail: true, maxTries: 3, waitBetweenTries: 2000`. Apps Script's own media download retries via `withRetry()`. |
 | 90 s polling latency | Cron lowered to 30 s. The same poll handles all four sweeps — finalize, approve, remind, confirm. |
 | No archival | New `archiveOldPosts()` runs daily at 03:00. Moves rows in `Posted / Posted (FB only) / Failed / Error / Superseded` older than 30 days into a sibling `Archive` tab, preserving headers and column widths. |
 

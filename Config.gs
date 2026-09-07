@@ -102,7 +102,13 @@ function getIgUserId() {
 }
 
 // ── Sarvam AI ─────────────────────────────────────────────────
-var SARVAM_MODEL   = 'sarvam-105b';
+// Use the NON-reasoning conversational variant. The plain 'sarvam-105b' is a
+// reasoning model that generates enormous chain-of-thought (observed 22k+
+// chars / 8k+ tokens) before any output, repeatedly hitting max_tokens with
+// finish_reason=length and null content. The '-conversations' variant answers
+// directly without that reasoning phase, so caption/headline + article
+// generation complete reliably within the token budget.
+var SARVAM_MODEL   = 'sarvam-105b-conversations';
 var SARVAM_API_URL = 'https://api.sarvam.ai/v1/chat/completions';
 
 // ── Facebook Graph API ────────────────────────────────────────
